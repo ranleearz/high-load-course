@@ -19,6 +19,7 @@ target/
 *.iml
 *.ipr
 ./http-client.env.json
+http-client.env.json
 
 ### NetBeans ###
 /nbproject/private/
@@ -33,3 +34,9 @@ build/
 
 ### VS Code ###
 .vscode/
+
+### Grafana ###
+/grafana/data
+
+### Prometeus ###
+/prometheus/data
