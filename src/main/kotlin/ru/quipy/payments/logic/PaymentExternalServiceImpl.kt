@@ -13,6 +13,7 @@ import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.TimeUnit
 
 
 // Advice: always treat time as a Duration
@@ -37,7 +38,9 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimiter = SlidingWindowRateLimiter(properties.rateLimitPerSec.toLong(), Duration.ofSeconds(1))
 
     private val client = OkHttpClient.Builder()
-        .callTimeout(Duration.ofMillis(expectedProcessingMs * 2))
+        .connectTimeout(Duration.ZERO)
+        .readTimeout(Duration.ZERO)
+        .writeTimeout(Duration.ZERO)
         .build()
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
@@ -48,6 +51,11 @@ class PaymentExternalSystemAdapterImpl(
         var submitted = false
 
         try {
+            if (now() + expectedProcessingMs >= deadline) {
+                reject(paymentId, transactionId, paymentStartedAt, "Deadline is too close.")
+                return
+            }
+
             window.acquire()
             acquired = true
 
@@ -78,11 +86,15 @@ class PaymentExternalSystemAdapterImpl(
                 post(emptyBody)
             }.build()
 
-            client.newCall(request).execute().use { response ->
+            val call = client.newCall(request)
+            call.timeout().timeout(deadline - now(), TimeUnit.MILLISECONDS)
+
+            call.execute().use { response ->
+                val responseBody = response.body?.string()
                 val body = try {
-                    mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
+                    mapper.readValue(responseBody, ExternalSysResponse::class.java)
                 } catch (e: Exception) {
-                    logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
+                    logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: $responseBody")
                     ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
                 }
 

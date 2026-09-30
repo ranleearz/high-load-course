@@ -19,8 +19,8 @@ services:
     image: quay.io/prometheus/prometheus:v2.32.0
     user: root
     volumes:
-      - ./prometheus/data:/prometheus
-      - ./prometheus:/etc/prometheus
+      - ./prometheus/data:/prometheus:z
+      - ./prometheus:/etc/prometheus:z
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
@@ -35,8 +35,8 @@ services:
     image: grafana/grafana
     user: root
     volumes:
-      - ./grafana/data:/var/lib/grafana
-      - ./grafana/provisioning/:/etc/grafana/provisioning
+      - ./grafana/data:/var/lib/grafana:z
+      - ./grafana/provisioning/:/etc/grafana/provisioning:z
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=quipy
       - GF_USERS_ALLOW_SIGN_UP=false
