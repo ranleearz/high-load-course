@@ -16,6 +16,7 @@ class OrderPayer(
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
     private val paymentService: PaymentService,
     private val meterRegistry: MeterRegistry,
+    paymentAccounts: List<PaymentExternalSystemAdapter>,
 ) {
     companion object {
         val logger = LoggerFactory.getLogger(OrderPayer::class.java)
@@ -29,65 +30,56 @@ class OrderPayer(
         val createdAt: Long
     ) : Runnable {
         override fun run() {
-            val now = System.currentTimeMillis()
-            val waitTimeMs = now - createdAt
-            queueWaitTimer.record(waitTimeMs, TimeUnit.MILLISECONDS)
+            var submitted = false
+            try {
+                val now = System.currentTimeMillis()
+                val waitTimeMs = now - createdAt
+                queueWaitTimer.record(waitTimeMs, TimeUnit.MILLISECONDS)
 
-            val createdEvent = paymentESService.create {
-                it.create(paymentId, orderId, amount)
-            }
-
-            if (now >= deadline) {
-                logger.warn(
-                    "Payment $paymentId for order $orderId REJECTED: " +
-                        "deadline exceeded by ${now - deadline}ms"
-                )
-                paymentESService.update(paymentId) {
-                    it.logSubmission(
-                        success = false,
-                        UUID.randomUUID(),
-                        now,
-                        Duration.ofMillis(waitTimeMs)
-                    )
-                    it.logProcessing(
-                        false,
-                        now,
-                        UUID.randomUUID(),
-                        reason = "Deadline exceeded before processing (waited ${waitTimeMs}ms)"
-                    )
+                paymentESService.create {
+                    it.create(paymentId, orderId, amount)
                 }
-                return
-            }
 
-            val timeRemaining = deadline - now
-            if (timeRemaining < 1_000) {
-                logger.warn(
-                    "Payment $paymentId for order $orderId has only ${timeRemaining}ms left, skipping"
-                )
-                paymentESService.update(paymentId) {
-                    it.logSubmission(
-                        success = false,
-                        UUID.randomUUID(),
-                        now,
-                        Duration.ofMillis(waitTimeMs)
+                if (now >= deadline) {
+                    logger.debug(
+                        "Payment $paymentId for order $orderId rejected: " +
+                            "deadline exceeded by ${now - deadline}ms"
                     )
-                    it.logProcessing(
-                        false,
-                        now,
-                        UUID.randomUUID(),
-                        reason = "Insufficient time remaining: ${timeRemaining}ms"
-                    )
+                    paymentESService.update(paymentId) {
+                        it.logSubmission(
+                            success = false,
+                            UUID.randomUUID(),
+                            now,
+                            Duration.ofMillis(waitTimeMs)
+                        )
+                        it.logProcessing(
+                            false,
+                            now,
+                            UUID.randomUUID(),
+                            reason = "Deadline exceeded before processing (waited ${waitTimeMs}ms)"
+                        )
+                    }
+                    return
                 }
-                return
-            }
 
-            logger.trace(
-                "Payment ${createdEvent.paymentId} for order $orderId created " +
-                    "with ${timeRemaining}ms remaining"
-            )
-            paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+                logger.trace(
+                    "Payment $paymentId for order $orderId created " +
+                        "with ${deadline - now}ms remaining"
+                )
+                submitted = true
+                paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+            } finally {
+                if (!submitted) {
+                    paymentService.releaseAdmission()
+                }
+            }
         }
     }
+
+    private val workerCount = paymentAccounts
+        .filter { it.isEnabled() }
+        .sumOf { it.parallelism() }
+        .coerceAtLeast(8)
 
     private val paymentQueue = PriorityBlockingQueue<Runnable>(
         8_000,
@@ -97,8 +89,8 @@ class OrderPayer(
     )
 
     private val paymentExecutor = ThreadPoolExecutor(
-        8,
-        8,
+        workerCount,
+        workerCount,
         0L,
         TimeUnit.MILLISECONDS,
         paymentQueue,
@@ -123,8 +115,6 @@ class OrderPayer(
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = System.currentTimeMillis()
-
-        checkCanAccept(deadline)
 
         val scheduledPayment = ScheduledPayment(orderId, amount, paymentId, deadline, createdAt)
 
