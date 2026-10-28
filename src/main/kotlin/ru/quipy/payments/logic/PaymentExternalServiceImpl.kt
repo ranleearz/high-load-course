@@ -30,7 +30,7 @@ class PaymentExternalSystemAdapterImpl(
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapterImpl::class.java)
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
-        private const val ADMISSION_MARGIN_MS = 500L
+        private const val ADMISSION_MARGIN_MS = 1500L
     }
 
     private val serviceName = properties.serviceName
