@@ -21,13 +21,26 @@ class PaymentSystemImpl(
         val logger = LoggerFactory.getLogger(PaymentSystemImpl::class.java)
     }
 
-    override fun canAccept(deadline: Long, queuedRequests: Int): Boolean =
-        paymentAccounts.filter { it.isEnabled() }.all {
-            it.canAccept(deadline, queuedRequests)
+    override fun canAccept(deadline: Long, queuedRequests: Int): Boolean {
+        val reserved = ArrayList<PaymentExternalSystemAdapter>()
+        for (account in paymentAccounts) {
+            if (!account.isEnabled()) continue
+            if (!account.canAccept(deadline, queuedRequests)) {
+                reserved.forEach { it.releaseAdmission() }
+                return false
+            }
+            reserved.add(account)
         }
+        return true
+    }
+
+    override fun releaseAdmission() {
+        paymentAccounts.filter { it.isEnabled() }.forEach { it.releaseAdmission() }
+    }
 
     override fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         for (account in paymentAccounts) {
+            if (!account.isEnabled()) continue
             account.performPaymentAsync(paymentId, amount, paymentStartedAt, deadline)
         }
     }
