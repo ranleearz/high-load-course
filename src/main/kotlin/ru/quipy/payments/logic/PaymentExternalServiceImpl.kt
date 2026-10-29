@@ -16,6 +16,7 @@ import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.ConcurrentLinkedDeque
+import java.util.concurrent.Executors
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -34,6 +35,9 @@ class PaymentExternalSystemAdapterImpl(
         private const val ADMISSION_MARGIN_MS = 500L
         private const val WARMUP_SAMPLES = 100
         private const val WARMUP_FACTOR = 2.0
+        private val slotReleaser = Executors.newSingleThreadScheduledExecutor { r ->
+            Thread(r, "payment-slot-releaser").apply { isDaemon = true }
+        }
     }
 
     private val serviceName = properties.serviceName
@@ -49,7 +53,7 @@ class PaymentExternalSystemAdapterImpl(
     private var processingP99Ms = (expectedProcessingMs * WARMUP_FACTOR).toLong().coerceAtLeast(1)
 
     @Volatile
-    private var processingAvgMs = expectedProcessingMs.coerceAtLeast(1)
+    private var processingAvgMs = processingP99Ms
 
     private val parallelRequestsSemaphore = Semaphore(parallelPermits, true)
 
@@ -134,6 +138,7 @@ class PaymentExternalSystemAdapterImpl(
             val waitTime = submittedAt - now
             var result = false
             var reason: String? = null
+            var timedOut = false
 
             processing.incrementAndGet()
             try {
@@ -162,14 +167,21 @@ class PaymentExternalSystemAdapterImpl(
                 }
             } catch (e: Exception) {
                 logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
+                timedOut = e is InterruptedIOException
                 reason = when (e) {
                     is SocketTimeoutException, is InterruptedIOException -> "HTTP request timeout after ${e.message}"
                     else -> e.message ?: "Unknown error"
                 }
             } finally {
-                recordProcessing(System.currentTimeMillis() - submittedAt)
+                val elapsed = System.currentTimeMillis() - submittedAt
+                recordProcessing(elapsed)
                 processing.decrementAndGet()
-                parallelRequestsSemaphore.release()
+                val releaseDelay = if (timedOut) processingP99Ms - elapsed else 0L
+                if (releaseDelay > 0) {
+                    slotReleaser.schedule({ parallelRequestsSemaphore.release() }, releaseDelay, TimeUnit.MILLISECONDS)
+                } else {
+                    parallelRequestsSemaphore.release()
+                }
                 permitHeld = false
             }
 
@@ -231,11 +243,12 @@ class PaymentExternalSystemAdapterImpl(
         val sorted = processingSamples.toList().sorted()
         if (sorted.isEmpty()) return
         val p99 = sorted[((sorted.size - 1) * 0.99).toInt()].coerceAtLeast(1)
-        processingAvgMs = sorted.average().toLong().coerceAtLeast(1)
-        processingP99Ms = if (sorted.size < WARMUP_SAMPLES) {
-            maxOf(p99, (expectedProcessingMs * WARMUP_FACTOR).toLong())
+        if (sorted.size < WARMUP_SAMPLES) {
+            processingP99Ms = maxOf(p99, (expectedProcessingMs * WARMUP_FACTOR).toLong())
+            processingAvgMs = processingP99Ms
         } else {
-            p99
+            processingP99Ms = p99
+            processingAvgMs = sorted.average().toLong().coerceAtLeast(1)
         }
     }
 }
