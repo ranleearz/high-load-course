@@ -76,10 +76,10 @@ class OrderPayer(
         }
     }
 
-    private val workerCount = paymentAccounts
+    private val workerCount = (paymentAccounts
         .filter { it.isEnabled() }
-        .sumOf { it.parallelism() }
-        .coerceAtLeast(8)
+        .sumOf { it.parallelism() } * 2)
+        .coerceAtLeast(16)
 
     private val paymentQueue = PriorityBlockingQueue<Runnable>(
         8_000,
@@ -131,6 +131,8 @@ class OrderPayer(
             )
         }
     }
+
+    fun releaseAdmission() = paymentService.releaseAdmission()
 
     fun shutdown() {
         paymentExecutor.shutdown()

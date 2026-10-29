@@ -11,6 +11,7 @@ import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
+import java.io.InterruptedIOException
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
@@ -31,6 +32,8 @@ class PaymentExternalSystemAdapterImpl(
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
         private const val ADMISSION_MARGIN_MS = 500L
+        private const val WARMUP_SAMPLES = 100
+        private const val WARMUP_FACTOR = 2.0
     }
 
     private val serviceName = properties.serviceName
@@ -40,6 +43,13 @@ class PaymentExternalSystemAdapterImpl(
     private val maxProcessingSamples = 512
     private val parallelPermits = properties.parallelRequests.coerceAtLeast(1)
     private val inFlight = AtomicInteger(0)
+    private val processing = AtomicInteger(0)
+
+    @Volatile
+    private var processingP99Ms = (expectedProcessingMs * WARMUP_FACTOR).toLong().coerceAtLeast(1)
+
+    @Volatile
+    private var processingAvgMs = expectedProcessingMs.coerceAtLeast(1)
 
     private val parallelRequestsSemaphore = Semaphore(parallelPermits, true)
 
@@ -63,12 +73,13 @@ class PaymentExternalSystemAdapterImpl(
             return false
         }
         val now = System.currentTimeMillis()
-        val processingMs = processingP99Millis()
-        val throughput = throughputPerSec(processingMs)
+        val processingMs = processingP99Ms
+        val throughput = throughputPerSec()
         while (true) {
             val current = inFlight.get()
+            val queuedAhead = (current - processing.get()).coerceAtLeast(0)
             val predictedCompletion =
-                now + (current / throughput) * 1000.0 + processingMs + ADMISSION_MARGIN_MS
+                now + (queuedAhead / throughput) * 1000.0 + processingMs + ADMISSION_MARGIN_MS
             if (predictedCompletion >= deadline) {
                 return false
             }
@@ -87,7 +98,7 @@ class PaymentExternalSystemAdapterImpl(
         try {
             logger.debug("[$accountName] Submitting payment request for payment $paymentId")
             val transactionId = UUID.randomUUID()
-            val processingMs = processingP99Millis()
+            val processingMs = processingP99Ms
             val latestStart = deadline - processingMs - ADMISSION_MARGIN_MS
             val now = System.currentTimeMillis()
 
@@ -112,32 +123,21 @@ class PaymentExternalSystemAdapterImpl(
             permitHeld = true
 
             if (!awaitRatePermit(latestStart)) {
+                parallelRequestsSemaphore.release()
+                permitHeld = false
                 logger.debug("[$accountName] Payment $paymentId missed rate limit window")
                 reject(paymentId, transactionId, paymentStartedAt, "Deadline exceeded while waiting for rate limit")
                 return
             }
 
-            val afterWait = System.currentTimeMillis()
-            val waitTime = afterWait - now
-            val timeForProcessing = deadline - afterWait
-            if (timeForProcessing < processingMs) {
-                logger.debug(
-                    "[$accountName] Payment $paymentId has only ${timeForProcessing}ms left, but need ${processingMs}ms"
-                )
-                reject(paymentId, transactionId, paymentStartedAt, "Insufficient time for processing after wait")
-                return
-            }
+            val submittedAt = System.currentTimeMillis()
+            val waitTime = submittedAt - now
+            var result = false
+            var reason: String? = null
 
-            logger.debug(
-                "[$accountName] Payment $paymentId acquired slot after ${waitTime}ms, ${timeForProcessing}ms remaining"
-            )
-
+            processing.incrementAndGet()
             try {
-                paymentESService.update(paymentId) {
-                    it.logSubmission(success = true, transactionId, afterWait, Duration.ofMillis(waitTime))
-                }
-
-                logger.debug("[$accountName] Submit: $paymentId , txId: $transactionId")
+                logger.debug("[$accountName] Submit: $paymentId , txId: $transactionId, waited ${waitTime}ms")
 
                 val request = Request.Builder().run {
                     url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
@@ -156,27 +156,29 @@ class PaymentExternalSystemAdapterImpl(
                         logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: $responseBody")
                         ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
                     }
-
                     logger.debug("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
-
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(body.result, System.currentTimeMillis(), transactionId, reason = body.message)
-                    }
-                    recordProcessing(System.currentTimeMillis() - afterWait)
+                    result = body.result
+                    reason = body.message
                 }
             } catch (e: Exception) {
                 logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
-                paymentESService.update(paymentId) {
-                    it.logProcessing(
-                        false,
-                        System.currentTimeMillis(),
-                        transactionId,
-                        reason = when (e) {
-                            is SocketTimeoutException -> "HTTP request timeout after ${e.message}"
-                            else -> e.message ?: "Unknown error"
-                        }
-                    )
+                reason = when (e) {
+                    is SocketTimeoutException, is InterruptedIOException -> "HTTP request timeout after ${e.message}"
+                    else -> e.message ?: "Unknown error"
                 }
+            } finally {
+                recordProcessing(System.currentTimeMillis() - submittedAt)
+                processing.decrementAndGet()
+                parallelRequestsSemaphore.release()
+                permitHeld = false
+            }
+
+            val processedAt = System.currentTimeMillis()
+            paymentESService.update(paymentId) {
+                it.logSubmission(success = true, transactionId, submittedAt, Duration.ofMillis(waitTime))
+            }
+            paymentESService.update(paymentId) {
+                it.logProcessing(result, processedAt, transactionId, reason = reason)
             }
         } finally {
             if (permitHeld) {
@@ -215,9 +217,9 @@ class PaymentExternalSystemAdapterImpl(
         }
     }
 
-    private fun throughputPerSec(processingMs: Long): Double {
-        val processingSec = processingMs.coerceAtLeast(1) / 1000.0
-        val byParallel = parallelPermits / processingSec
+    private fun throughputPerSec(): Double {
+        val avgSec = processingAvgMs.coerceAtLeast(1) / 1000.0
+        val byParallel = parallelPermits / avgSec
         return minOf(properties.rateLimitPerSec.toDouble(), byParallel).coerceAtLeast(0.001)
     }
 
@@ -226,15 +228,14 @@ class PaymentExternalSystemAdapterImpl(
         while (processingSamples.size > maxProcessingSamples) {
             processingSamples.pollFirst()
         }
-    }
-
-    private fun processingP99Millis(): Long {
-        val values = processingSamples.toList()
-        if (values.isEmpty()) {
-            return expectedProcessingMs.coerceAtLeast(1)
+        val sorted = processingSamples.toList().sorted()
+        if (sorted.isEmpty()) return
+        val p99 = sorted[((sorted.size - 1) * 0.99).toInt()].coerceAtLeast(1)
+        processingAvgMs = sorted.average().toLong().coerceAtLeast(1)
+        processingP99Ms = if (sorted.size < WARMUP_SAMPLES) {
+            maxOf(p99, (expectedProcessingMs * WARMUP_FACTOR).toLong())
+        } else {
+            p99
         }
-        val sorted = values.sorted()
-        val index = ((sorted.size - 1) * 0.99).toInt()
-        return sorted[index].coerceAtLeast(1)
     }
 }
