@@ -1,6 +1,7 @@
 package ru.quipy.payments.logic
 
 import io.micrometer.core.instrument.Gauge
+import io.micrometer.core.instrument.Counter
 import io.micrometer.core.instrument.MeterRegistry
 import io.micrometer.core.instrument.Timer
 import org.slf4j.LoggerFactory
@@ -107,7 +108,20 @@ class OrderPayer(
         .publishPercentileHistogram()
         .register(meterRegistry)
 
+    private val accepted = Counter.builder("payment_admission")
+        .tag("result", "accepted")
+        .register(meterRegistry)
+    private val rejected = Counter.builder("payment_admission")
+        .tag("result", "rejected")
+        .register(meterRegistry)
+
     init {
+        Gauge.builder("payment_in_flight") {
+            paymentAccounts.sumOf { it.admittedCount() }.toDouble()
+        }.register(meterRegistry)
+        Gauge.builder("payment_rate_waiters") {
+            paymentAccounts.sumOf { it.rateWaiters() }.toDouble()
+        }.register(meterRegistry)
         Gauge.builder("payment_queue_size") { paymentQueue.size.toDouble() }
             .description("Current number of tasks waiting in the payment priority queue")
             .register(meterRegistry)
@@ -125,11 +139,13 @@ class OrderPayer(
 
     fun checkCanAccept(deadline: Long) {
         if (!paymentService.canAccept(deadline, paymentQueue.size)) {
+            rejected.increment()
             throw org.springframework.web.server.ResponseStatusException(
                 org.springframework.http.HttpStatus.TOO_MANY_REQUESTS,
                 "Payment cannot complete before deadline"
             )
         }
+        accepted.increment()
     }
 
     fun releaseAdmission() = paymentService.releaseAdmission()

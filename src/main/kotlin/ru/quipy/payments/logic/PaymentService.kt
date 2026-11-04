@@ -29,6 +29,10 @@ interface PaymentExternalSystemAdapter {
 
     fun parallelism(): Int
 
+    fun admittedCount(): Int
+
+    fun rateWaiters(): Int
+
     fun name(): String
 
     fun price(): Int

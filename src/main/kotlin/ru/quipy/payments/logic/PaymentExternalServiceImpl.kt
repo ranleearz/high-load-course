@@ -208,21 +208,18 @@ class PaymentExternalSystemAdapterImpl(
     override fun isEnabled() = properties.enabled
     override fun name() = properties.accountName
     override fun parallelism() = parallelPermits
+    override fun admittedCount() = inFlight.get()
+    override fun rateWaiters() = rateLimiter.waitingCount()
 
     private fun awaitRatePermit(latestStart: Long): Boolean {
-        while (!rateLimiter.tick()) {
-            val remaining = latestStart - System.currentTimeMillis()
-            if (remaining <= 0) {
-                return false
-            }
-            try {
-                Thread.sleep(minOf(5L, remaining))
-            } catch (e: InterruptedException) {
-                Thread.currentThread().interrupt()
-                return false
-            }
+        val remaining = latestStart - System.currentTimeMillis()
+        if (remaining <= 0) return false
+        return try {
+            rateLimiter.awaitPermit(Duration.ofMillis(remaining))
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
         }
-        return true
     }
 
     private fun reject(paymentId: UUID, transactionId: UUID, paymentStartedAt: Long, reason: String) {
