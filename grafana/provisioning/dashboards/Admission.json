@@ -1,5 +1,5 @@
 {
-  "title": "Оплаты: приём и ожидание",
+  "title": "Кейс 5: приём и ожидание",
   "uid": "payment-admission",
   "schemaVersion": 39,
   "version": 1,
@@ -33,7 +33,7 @@
     {
       "id": 1,
       "type": "timeseries",
-      "title": "Приём оплат: решений в секунду",
+      "title": "Провайдер acc-23: скорость за 10 секунд",
       "datasource": {
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
@@ -43,6 +43,76 @@
         "w": 12,
         "x": 0,
         "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(external_sys_duration_count{service=~\"$service\",accountName=\"acc-23\"}[10s]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Ошибки клиентских сценариев",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (testOutcome) (rate(test_duration_count{service=~\"$service\",testOutcome!=\"SUCCESS\"}[30s]))",
+          "legendFormat": "{{testOutcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Приём оплат: решений в секунду",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 9
       },
       "targets": [
         {
@@ -66,7 +136,7 @@
       }
     },
     {
-      "id": 2,
+      "id": 4,
       "type": "timeseries",
       "title": "Принятые, но ещё не законченные оплаты",
       "datasource": {
@@ -77,7 +147,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 0
+        "y": 9
       },
       "targets": [
         {
@@ -101,7 +171,7 @@
       }
     },
     {
-      "id": 3,
+      "id": 5,
       "type": "timeseries",
       "title": "Ожидают разрешение на исходящий вызов",
       "datasource": {
@@ -112,7 +182,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 9
+        "y": 18
       },
       "targets": [
         {
@@ -136,7 +206,7 @@
       }
     },
     {
-      "id": 4,
+      "id": 6,
       "type": "timeseries",
       "title": "Очередь рабочих задач",
       "datasource": {
@@ -147,7 +217,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 9
+        "y": 18
       },
       "targets": [
         {
