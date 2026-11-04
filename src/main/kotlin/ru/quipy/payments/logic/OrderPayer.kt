@@ -79,7 +79,7 @@ class OrderPayer(
     private val workerCount = (paymentAccounts
         .filter { it.isEnabled() }
         .sumOf { it.parallelism() } * 2)
-        .coerceAtLeast(16)
+        .coerceIn(16, 256)
 
     private val paymentQueue = PriorityBlockingQueue<Runnable>(
         8_000,

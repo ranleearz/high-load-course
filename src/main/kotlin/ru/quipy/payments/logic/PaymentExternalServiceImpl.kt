@@ -32,7 +32,7 @@ class PaymentExternalSystemAdapterImpl(
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapterImpl::class.java)
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
-        private const val ADMISSION_MARGIN_MS = 500L
+        private const val ADMISSION_MARGIN_MS = 100L
         private const val WARMUP_SAMPLES = 100
         private const val WARMUP_FACTOR = 2.0
         private val slotReleaser = Executors.newSingleThreadScheduledExecutor { r ->
@@ -76,14 +76,18 @@ class PaymentExternalSystemAdapterImpl(
         if (properties.rateLimitPerSec <= 0 || properties.parallelRequests <= 0) {
             return false
         }
-        val now = System.currentTimeMillis()
         val processingMs = processingP99Ms
-        val throughput = throughputPerSec()
         while (true) {
+            val now = System.currentTimeMillis()
             val current = inFlight.get()
-            val queuedAhead = (current - processing.get()).coerceAtLeast(0)
+            val active = processing.get()
+            val pending = (current - active).coerceAtLeast(0) + 1
+            val freeSlots = (parallelPermits - active).coerceAtLeast(0)
+            val parallelWaitMs = (pending - freeSlots).coerceAtLeast(0) *
+                processingAvgMs.toDouble() / parallelPermits
+            val rateWaitMs = rateLimiter.millisUntilAvailable(pending)
             val predictedCompletion =
-                now + (queuedAhead / throughput) * 1000.0 + processingMs + ADMISSION_MARGIN_MS
+                now + maxOf(parallelWaitMs, rateWaitMs.toDouble()) + processingMs + ADMISSION_MARGIN_MS
             if (predictedCompletion >= deadline) {
                 return false
             }
@@ -227,12 +231,6 @@ class PaymentExternalSystemAdapterImpl(
             it.logSubmission(success = false, transactionId, now, Duration.ofMillis(now - paymentStartedAt))
             it.logProcessing(false, now, transactionId, reason = reason)
         }
-    }
-
-    private fun throughputPerSec(): Double {
-        val avgSec = processingAvgMs.coerceAtLeast(1) / 1000.0
-        val byParallel = parallelPermits / avgSec
-        return minOf(properties.rateLimitPerSec.toDouble(), byParallel).coerceAtLeast(0.001)
     }
 
     private fun recordProcessing(durationMillis: Long) {
