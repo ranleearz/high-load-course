@@ -33,6 +33,7 @@ class PaymentExternalSystemAdapterImpl(
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
         private const val ADMISSION_MARGIN_MS = 100L
+        private const val RATE_WINDOW_GUARD_MS = 10L
         private const val WARMUP_SAMPLES = 100
         private const val WARMUP_FACTOR = 2.0
         private val slotReleaser = Executors.newSingleThreadScheduledExecutor { r ->
@@ -57,7 +58,10 @@ class PaymentExternalSystemAdapterImpl(
 
     private val parallelRequestsSemaphore = Semaphore(parallelPermits, true)
 
-    private val rateLimiter = SlidingWindowRateLimiter(properties.rateLimitPerSec.toLong(), Duration.ofSeconds(1))
+    private val rateLimiter = SlidingWindowRateLimiter(
+        properties.rateLimitPerSec.toLong(),
+        Duration.ofMillis(1000 + RATE_WINDOW_GUARD_MS),
+    )
 
     private val client = OkHttpClient.Builder()
         .dispatcher(
