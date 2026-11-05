@@ -12,6 +12,7 @@ import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.io.InterruptedIOException
+import java.io.IOException
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
@@ -63,7 +64,24 @@ class PaymentExternalSystemAdapterImpl(
         Duration.ofMillis(1000 + RATE_WINDOW_GUARD_MS),
     )
 
+    private class PaymentAttempt(val latestStart: Long) {
+        var submittedAt: Long? = null
+    }
+
+    private class RateWaitTimeout : IOException("Deadline exceeded while waiting for rate limit")
+
     private val client = OkHttpClient.Builder()
+        .addNetworkInterceptor { chain ->
+            val attempt = checkNotNull(chain.request().tag(PaymentAttempt::class.java))
+            if (attempt.submittedAt != null) {
+                processing.decrementAndGet()
+                attempt.submittedAt = null
+            }
+            if (!awaitRatePermit(attempt.latestStart)) throw RateWaitTimeout()
+            attempt.submittedAt = System.currentTimeMillis()
+            processing.incrementAndGet()
+            chain.proceed(chain.request())
+        }
         .dispatcher(
             Dispatcher().apply {
                 maxRequests = parallelPermits
@@ -134,27 +152,16 @@ class PaymentExternalSystemAdapterImpl(
             }
             permitHeld = true
 
-            if (!awaitRatePermit(latestStart)) {
-                parallelRequestsSemaphore.release()
-                permitHeld = false
-                logger.debug("[$accountName] Payment $paymentId missed rate limit window")
-                reject(paymentId, transactionId, paymentStartedAt, "Deadline exceeded while waiting for rate limit")
-                return
-            }
-
-            val submittedAt = System.currentTimeMillis()
-            val waitTime = submittedAt - now
+            val attempt = PaymentAttempt(latestStart)
             var result = false
             var reason: String? = null
             var timedOut = false
 
-            processing.incrementAndGet()
             try {
-                logger.debug("[$accountName] Submit: $paymentId , txId: $transactionId, waited ${waitTime}ms")
-
                 val request = Request.Builder().run {
                     url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
                     post(emptyBody)
+                    tag(PaymentAttempt::class.java, attempt)
                 }.build()
 
                 val call = client.newCall(request)
@@ -174,17 +181,22 @@ class PaymentExternalSystemAdapterImpl(
                     reason = body.message
                 }
             } catch (e: Exception) {
-                logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
+                if (e !is RateWaitTimeout) {
+                    logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
+                }
                 timedOut = e is InterruptedIOException
                 reason = when (e) {
+                    is RateWaitTimeout -> e.message
                     is SocketTimeoutException, is InterruptedIOException -> "HTTP request timeout after ${e.message}"
                     else -> e.message ?: "Unknown error"
                 }
             } finally {
-                val elapsed = System.currentTimeMillis() - submittedAt
-                recordProcessing(elapsed)
-                processing.decrementAndGet()
-                val releaseDelay = if (timedOut) processingP99Ms - elapsed else 0L
+                val elapsed = attempt.submittedAt?.let { System.currentTimeMillis() - it }
+                if (elapsed != null) {
+                    recordProcessing(elapsed)
+                    processing.decrementAndGet()
+                }
+                val releaseDelay = if (timedOut && elapsed != null) processingP99Ms - elapsed else 0L
                 if (releaseDelay > 0) {
                     slotReleaser.schedule({ parallelRequestsSemaphore.release() }, releaseDelay, TimeUnit.MILLISECONDS)
                 } else {
@@ -194,8 +206,11 @@ class PaymentExternalSystemAdapterImpl(
             }
 
             val processedAt = System.currentTimeMillis()
+            if (!result) logger.warn("[$accountName] Payment $paymentId failed: $reason")
+            val submittedAt = attempt.submittedAt ?: processedAt
+            val waitTime = submittedAt - now
             paymentESService.update(paymentId) {
-                it.logSubmission(success = true, transactionId, submittedAt, Duration.ofMillis(waitTime))
+                it.logSubmission(success = attempt.submittedAt != null, transactionId, submittedAt, Duration.ofMillis(waitTime))
             }
             paymentESService.update(paymentId) {
                 it.logProcessing(result, processedAt, transactionId, reason = reason)
@@ -227,6 +242,7 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     private fun reject(paymentId: UUID, transactionId: UUID, paymentStartedAt: Long, reason: String) {
+        logger.warn("[$accountName] Payment $paymentId rejected: $reason")
         val now = System.currentTimeMillis()
         paymentESService.update(paymentId) {
             it.logSubmission(success = false, transactionId, now, Duration.ofMillis(now - paymentStartedAt))
