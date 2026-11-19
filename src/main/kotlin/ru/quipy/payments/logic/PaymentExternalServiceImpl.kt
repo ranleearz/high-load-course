@@ -2,6 +2,10 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.micrometer.core.instrument.Counter
+import io.micrometer.core.instrument.Gauge
+import io.micrometer.core.instrument.MeterRegistry
+import io.micrometer.core.instrument.Timer
 import okhttp3.Call
 import okhttp3.ConnectionPool
 import okhttp3.Dispatcher
@@ -29,6 +33,7 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
     private val paymentProviderHostPort: String,
     private val token: String,
+    private val meterRegistry: MeterRegistry,
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -40,6 +45,7 @@ class PaymentExternalSystemAdapterImpl(
         private const val WARMUP_SAMPLES = 100
         private const val WARMUP_FACTOR = 2.0
         private const val RETRY_PARALLELISM = 2
+        private const val ATTEMPT_TIMEOUT_FACTOR = 1.2
         private val attemptExecutor = Executors.newCachedThreadPool { r ->
             Thread(r, "payment-attempt").apply { isDaemon = true }
         }
@@ -67,6 +73,27 @@ class PaymentExternalSystemAdapterImpl(
     private var processingP50Ms = expectedProcessingMs.coerceAtLeast(1)
 
     private val parallelRequestsSemaphore = Semaphore(parallelPermits, true)
+
+    init {
+        Gauge.builder("payment_attempt_timeout") { attemptTimeoutMs() / 1000.0 }
+            .description("Current per-attempt HTTP timeout")
+            .tag("account", accountName)
+            .baseUnit("seconds")
+            .register(meterRegistry)
+    }
+
+    private fun retryCounter(reason: String) = Counter.builder("payment_retry")
+        .description("Repeated calls to the external system, by reason of the previous failure")
+        .tag("account", accountName)
+        .tag("reason", reason)
+        .register(meterRegistry)
+
+    private fun attemptTimer(outcome: String) = Timer.builder("payment_attempt_duration")
+        .description("Duration of a single call to the external system, by outcome")
+        .tag("account", accountName)
+        .tag("outcome", outcome)
+        .publishPercentileHistogram()
+        .register(meterRegistry)
 
     private val rateLimiter = SlidingWindowRateLimiter(
         properties.rateLimitPerSec.toLong(),
@@ -131,7 +158,7 @@ class PaymentExternalSystemAdapterImpl(
             val pending = (current - active).coerceAtLeast(0) + 1
             val freeSlots = (parallelPermits - active).coerceAtLeast(0)
             val parallelWaitMs = (pending - freeSlots).coerceAtLeast(0) *
-                processingAvgMs.toDouble() / parallelPermits
+                    processingAvgMs.toDouble() / parallelPermits
             val rateWaitMs = rateLimiter.millisUntilAvailable(pending)
             val predictedCompletion =
                 now + maxOf(parallelWaitMs, rateWaitMs.toDouble()) + processingMs + ADMISSION_MARGIN_MS
@@ -183,7 +210,8 @@ class PaymentExternalSystemAdapterImpl(
                 val roundLatestStart = retryLatestStart(deadline)
                 if (!awaitRatePermit(roundLatestStart)) break
                 val round = mutableListOf(PaymentAttempt(roundLatestStart, ratePermitHeld = true))
-                while (round.size < RETRY_PARALLELISM && parallelRequestsSemaphore.tryAcquire()) {
+                val width = if (System.currentTimeMillis() + attemptTimeoutMs() < roundLatestStart) 1 else RETRY_PARALLELISM
+                while (round.size < width && parallelRequestsSemaphore.tryAcquire()) {
                     if (!rateLimiter.tick()) {
                         parallelRequestsSemaphore.release()
                         break
@@ -191,6 +219,7 @@ class PaymentExternalSystemAdapterImpl(
                     round.add(PaymentAttempt(roundLatestStart, ratePermitHeld = true))
                 }
 
+                retryCounter(outcome.kind).increment(round.size.toDouble())
                 logger.debug("[$accountName] Retrying payment $paymentId with ${round.size} parallel attempt(s) after: ${outcome.reason}")
                 val outcomes = runRound(paymentId, amount, round, deadline)
                 attempts += outcomes.size
@@ -200,7 +229,7 @@ class PaymentExternalSystemAdapterImpl(
 
                 outcome = outcomes.firstOrNull { it.result }
                     ?: outcomes.firstOrNull { it.retryable }
-                    ?: outcomes.last()
+                            ?: outcomes.last()
             }
 
             releaseSlot(slotOutcome)
@@ -221,6 +250,7 @@ class PaymentExternalSystemAdapterImpl(
     private class AttemptOutcome(
         val transactionId: UUID,
         val result: Boolean,
+        val kind: String,
         val reason: String?,
         val retryable: Boolean,
         val timedOut: Boolean,
@@ -276,6 +306,8 @@ class PaymentExternalSystemAdapterImpl(
         var reason: String? = null
         var retryable = false
         var timedOut = false
+        var responded = false
+        var kind = "unknown"
 
         try {
             val request = Request.Builder().run {
@@ -285,7 +317,8 @@ class PaymentExternalSystemAdapterImpl(
             }.build()
 
             val call = client.newCall(request)
-            val httpTimeout = (deadline - System.currentTimeMillis() - 50).coerceAtLeast(1L)
+            val deadlineTimeout = deadline - System.currentTimeMillis() - 50
+            val httpTimeout = minOf(attemptTimeoutMs(), deadlineTimeout).coerceAtLeast(1L)
             call.timeout().timeout(httpTimeout, TimeUnit.MILLISECONDS)
             attempt.call = call
             if (attempt.cancelled) call.cancel()
@@ -302,13 +335,26 @@ class PaymentExternalSystemAdapterImpl(
                 result = body.result
                 reason = body.message
                 retryable = !result && (response.isSuccessful || response.code == 429 || response.code >= 500)
+                kind = when {
+                    result -> "success"
+                    response.code == 429 -> "rate_limit"
+                    response.isSuccessful -> "error"
+                    else -> "http_${response.code}"
+                }
+                responded = true
             }
         } catch (e: Exception) {
-            if (e !is RateWaitTimeout && !attempt.cancelled) {
+            timedOut = e is InterruptedIOException && !attempt.cancelled
+            if (e !is RateWaitTimeout && !attempt.cancelled && !timedOut) {
                 logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
             }
-            timedOut = e is InterruptedIOException && !attempt.cancelled
-            retryable = e is IOException && e !is RateWaitTimeout && e !is InterruptedIOException && !attempt.cancelled
+            retryable = e is IOException && e !is RateWaitTimeout && !attempt.cancelled
+            kind = when {
+                attempt.cancelled -> "cancelled"
+                e is RateWaitTimeout -> "rate_wait"
+                timedOut -> "timeout"
+                else -> "io_error"
+            }
             reason = when {
                 attempt.cancelled -> "Cancelled: another attempt succeeded"
                 e is RateWaitTimeout -> e.message
@@ -321,11 +367,12 @@ class PaymentExternalSystemAdapterImpl(
         val submittedAt = attempt.submittedAt
         val elapsed = submittedAt?.let { finishedAt - it }
         if (elapsed != null) {
-            if (!attempt.cancelled) recordProcessing(elapsed)
+            if (responded) recordProcessing(elapsed)
+            if (!attempt.cancelled) attemptTimer(kind).record(elapsed, TimeUnit.MILLISECONDS)
             processing.decrementAndGet()
         }
         return AttemptOutcome(
-            transactionId, result, reason, retryable, timedOut, attempt.cancelled,
+            transactionId, result, kind, reason, retryable, timedOut, attempt.cancelled,
             attempt.createdAt, submittedAt, elapsed, finishedAt
         )
     }
@@ -333,6 +380,8 @@ class PaymentExternalSystemAdapterImpl(
     private fun latestStart(deadline: Long) = deadline - processingP99Ms - ADMISSION_MARGIN_MS
 
     private fun retryLatestStart(deadline: Long) = deadline - processingP50Ms - ADMISSION_MARGIN_MS
+
+    private fun attemptTimeoutMs() = (processingP99Ms * ATTEMPT_TIMEOUT_FACTOR).toLong()
 
     override fun price() = properties.price
     override fun isEnabled() = properties.enabled
